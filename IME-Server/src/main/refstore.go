@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -71,9 +72,11 @@ func (ref ReferenceStore) GetByChar(char string) (*list.List, int) {
 
 // GetByZhuyin retrieves full candidate characters, given a UTF-8 zhuyin string
 func (ref ReferenceStore) GetByZhuyin(zhuyin string) (*list.List, int) {
+	zhuyin, tone := ref.SeparatePhonetic(zhuyin)
 	writeBack := make(chan *CharLookupResponse)
 	zhuyin = strings.TrimSpace(zhuyin)
-	queryInfo := Character{-1, "", zhuyin, "", -1, "", -1}
+	// take last character and see if number. If so, it's the tone
+	queryInfo := Character{-1, "", zhuyin, "", tone, "", -1}
 	ref.requestQueue <- &CharLookupRequest{queryInfo, writeBack}
 	response := <-writeBack
 	return response.CharList, response.NumResults
@@ -81,9 +84,10 @@ func (ref ReferenceStore) GetByZhuyin(zhuyin string) (*list.List, int) {
 
 // GetByZhuyin retrieves full candidate characters, given a pinyin string
 func (ref ReferenceStore) GetByPinyin(pinyin string) (*list.List, int) {
+	pinyin, tone := ref.SeparatePhonetic(pinyin)
 	writeBack := make(chan *CharLookupResponse)
 	pinyin = strings.TrimSpace(pinyin)
-	queryInfo := Character{-1, "", "", pinyin, -1, "", -1}
+	queryInfo := Character{-1, "", "", pinyin, tone, "", -1}
 	ref.requestQueue <- &CharLookupRequest{queryInfo, writeBack}
 	response := <-writeBack
 	return response.CharList, response.NumResults
@@ -99,17 +103,40 @@ func (ref ReferenceStore) GetByDefinition(definition string) (*list.List, int) {
 	return response.CharList, response.NumResults
 }
 
+// GetToneFromPhonetic extracts the numerical tone from pinyin/zhuyin
+// Thus, this doesn't work with accented text or with encodings that have
+// characters within the range of ascii numbers
+func (ref ReferenceStore) SeparatePhonetic(input string) (string, int) {
+	// Match anything that is not 0-9 up to a maximum of 12 characters
+	// (3 UTF-8 Zhuyin characters = 3 x 4 bytes = 12 chars)
+	// next, match only one number following that string.
+	tonePattern, _ := regexp.Compile("^[^0-9]{1,12}[0-6{1,1}]$")
+	//noTonePattern, _ := regexp.Compile("^[^0-9]{1,12}$")
+
+	if tonePattern.MatchString(input) {
+		num, _ := strconv.Atoi(input[len(input)-1 : len(input)])
+		return input[:len(input)-1], num
+	}
+	return input, -1
+}
+
 // Get is the base lookup function called only by the DB thread
 func (ref ReferenceStore) Get(partialChar Character) *CharLookupResponse {
-	var resultCount = 0
 	var toneString string
 
-	// first, check the cache
-	if val, ok := ref.zhuyinCache[partialChar.Zhuyin]; ok {
+	if partialChar.Tone == -1 {
+		toneString = ""
+	} else {
+		toneString = strconv.Itoa(partialChar.Tone)
+	}
+
+	// first, check the caches
+	if val, ok := ref.zhuyinCache[partialChar.Zhuyin+toneString]; ok {
 		return val
 	}
 
-	if val, ok := ref.pinyinCache[partialChar.Pinyin]; ok {
+	// pinyin cache
+	if val, ok := ref.pinyinCache[partialChar.Pinyin+toneString]; ok {
 		return val
 	}
 
@@ -119,12 +146,7 @@ func (ref ReferenceStore) Get(partialChar Character) *CharLookupResponse {
 						pinyin LIKE ? AND 
 						tone LIKE ? AND
 						definition LIKE ? 
-						LIMIT 50`)
-	if partialChar.Id == -1 {
-		toneString = ""
-	} else {
-		toneString = strconv.Itoa(partialChar.Tone)
-	}
+						ORDER BY freq DESC LIMIT 50`)
 
 	err := searchStmt.Exec(
 		"%"+partialChar.Character+"%",
@@ -147,13 +169,25 @@ func (ref ReferenceStore) Get(partialChar Character) *CharLookupResponse {
 		fmt.Printf("Id => %d\n", zhuyin.Id)
 		fmt.Printf("Title => %s\n", zhuyin.Character)
 		charList.PushBack(zhuyin)
-		resultCount++
 	}
 
+	var response = &CharLookupResponse{charList, charList.Len()}
 
-	// TODO: if zhuyin is not empty, cache there, etc.
-	//ref.zhuyinCache[CharLookupResposeCacheEntry{*charList,resultCount}
-	return &CharLookupResponse{charList, resultCount}
+	// Cache result
+	if charList.Len() > 0 {
+		var firstChar Character
+		// wtf Go syntax- convert value of linked list element to struct type Character
+		firstChar = charList.Front().Value.(Character)
+
+		// cache in zhuyin or pinyin
+		if firstChar.Pinyin != "" {
+			ref.pinyinCache[firstChar.Pinyin+strconv.Itoa(firstChar.Tone)] = response
+		}
+		if firstChar.Zhuyin != "" {
+			ref.zhuyinCache[firstChar.Zhuyin+strconv.Itoa(firstChar.Tone)] = response
+		}
+	}
+	return response
 }
 
 // requestThread is the "DB thread", an internal running goroutine
@@ -212,10 +246,10 @@ func NewReference(dbName string, useCache bool) *ReferenceStore {
 	//insertSql := `INSERT INTO characters(character, zhuyin, pinyin, tone, definition, freq)
 	//		      VALUES("我","WO","wo",3,"I, me", 0);`
 
-	//err = ref.conn.Exec(insertSql)
-	//if err != nil {
-	//	fmt.Println("Error while Inserting: %s", err)
-	//}
+	err = ref.conn.Exec(insertSql)
+	if err != nil {
+		fmt.Println("Error while Inserting: %s", err)
+	}
 
 	// load from caches, TODO: move to function
 	if useCache {
