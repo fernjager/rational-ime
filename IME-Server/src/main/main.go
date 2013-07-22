@@ -17,6 +17,6 @@ func main() {
 	_, num := ref.GetByChar("我")
 	_, num = ref.GetByPinyin("wo3")
 	_, num = ref.GetByPinyin("wo3")
-
+	ref.Close()
 	fmt.Println("num" + strconv.Itoa(num))
 }

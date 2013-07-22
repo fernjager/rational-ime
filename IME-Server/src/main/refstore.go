@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"code.google.com/p/gosqlite/sqlite"
-	"container/list"
 	"encoding/gob"
 	"fmt"
 	"io/ioutil"
@@ -46,7 +45,7 @@ type CharLookupRequest struct {
 // CharLookupResponse is an object that contains a list of complete character
 // objects. It is returned by the DB thread as the result of a character query
 type CharLookupResponse struct {
-	CharList   *list.List
+	CharList   []Character
 	NumResults int
 }
 
@@ -56,22 +55,21 @@ type CharLookupResponse struct {
 type ReferenceStore struct {
 	conn         *sqlite.Conn
 	requestQueue chan *CharLookupRequest
-	zhuyinCache  map[string]*CharLookupResponse
-	pinyinCache  map[string]*CharLookupResponse
+	GlobalCache  map[string]*CharLookupResponse
 }
 
 // GetByChar retrieves full candidate characters, given a UTF-8 Chinese character
-func (ref ReferenceStore) GetByChar(char string) (*list.List, int) {
+func (ref ReferenceStore) GetByChar(char string) (*[]Character, int) {
 	writeBack := make(chan *CharLookupResponse)
 	char = strings.TrimSpace(char)
 	queryInfo := Character{-1, char, "", "", -1, "", -1}
 	ref.requestQueue <- &CharLookupRequest{queryInfo, writeBack}
 	response := <-writeBack
-	return response.CharList, response.NumResults
+	return &response.CharList, response.NumResults
 }
 
 // GetByZhuyin retrieves full candidate characters, given a UTF-8 zhuyin string
-func (ref ReferenceStore) GetByZhuyin(zhuyin string) (*list.List, int) {
+func (ref ReferenceStore) GetByZhuyin(zhuyin string) (*[]Character, int) {
 	zhuyin, tone := ref.SeparatePhonetic(zhuyin)
 	writeBack := make(chan *CharLookupResponse)
 	zhuyin = strings.TrimSpace(zhuyin)
@@ -79,28 +77,28 @@ func (ref ReferenceStore) GetByZhuyin(zhuyin string) (*list.List, int) {
 	queryInfo := Character{-1, "", zhuyin, "", tone, "", -1}
 	ref.requestQueue <- &CharLookupRequest{queryInfo, writeBack}
 	response := <-writeBack
-	return response.CharList, response.NumResults
+	return &response.CharList, response.NumResults
 }
 
 // GetByZhuyin retrieves full candidate characters, given a pinyin string
-func (ref ReferenceStore) GetByPinyin(pinyin string) (*list.List, int) {
+func (ref ReferenceStore) GetByPinyin(pinyin string) (*[]Character, int) {
 	pinyin, tone := ref.SeparatePhonetic(pinyin)
 	writeBack := make(chan *CharLookupResponse)
 	pinyin = strings.TrimSpace(pinyin)
 	queryInfo := Character{-1, "", "", pinyin, tone, "", -1}
 	ref.requestQueue <- &CharLookupRequest{queryInfo, writeBack}
 	response := <-writeBack
-	return response.CharList, response.NumResults
+	return &response.CharList, response.NumResults
 }
 
 // GetByDefinition retreives full candidate characters, given an English definition
-func (ref ReferenceStore) GetByDefinition(definition string) (*list.List, int) {
+func (ref ReferenceStore) GetByDefinition(definition string) (*[]Character, int) {
 	writeBack := make(chan *CharLookupResponse)
 	definition = strings.TrimSpace(definition)
 	queryInfo := Character{-1, "", "", "", -1, definition, -1}
 	ref.requestQueue <- &CharLookupRequest{queryInfo, writeBack}
 	response := <-writeBack
-	return response.CharList, response.NumResults
+	return &response.CharList, response.NumResults
 }
 
 // GetToneFromPhonetic extracts the numerical tone from pinyin/zhuyin
@@ -130,22 +128,20 @@ func (ref ReferenceStore) Get(partialChar Character) *CharLookupResponse {
 		toneString = strconv.Itoa(partialChar.Tone)
 	}
 
-	// first, check the caches
-	if val, ok := ref.zhuyinCache[partialChar.Zhuyin+toneString]; ok {
+	// first, check the cache
+	if val, ok := ref.GlobalCache[partialChar.Zhuyin+toneString]; ok {
 		return val
 	}
-
-	// pinyin cache
-	if val, ok := ref.pinyinCache[partialChar.Pinyin+toneString]; ok {
+	if val, ok := ref.GlobalCache[partialChar.Pinyin+toneString]; ok {
 		return val
 	}
 
 	searchStmt, _ := ref.conn.Prepare(`SELECT * FROM characters WHERE
 						character LIKE ? AND
-						zhuyin LIKE ? AND 
-						pinyin LIKE ? AND 
+						zhuyin LIKE ? AND
+						pinyin LIKE ? AND
 						tone LIKE ? AND
-						definition LIKE ? 
+						definition LIKE ?
 						ORDER BY freq DESC LIMIT 50`)
 
 	err := searchStmt.Exec(
@@ -157,34 +153,41 @@ func (ref ReferenceStore) Get(partialChar Character) *CharLookupResponse {
 	if err != nil {
 		fmt.Println("Error while Selecting: %s", err)
 	}
-	charList := list.New()
+
+	var charList []Character
 	for searchStmt.Next() {
-		var zhuyin Character
-		err = searchStmt.Scan(&zhuyin.Id, &zhuyin.Character, &zhuyin.Zhuyin, &zhuyin.Pinyin, &zhuyin.Tone, &zhuyin.Definition, &zhuyin.Freq)
+		var resultChar Character
+		err = searchStmt.Scan(&resultChar.Id,
+			&resultChar.Character,
+			&resultChar.Zhuyin,
+			&resultChar.Pinyin,
+			&resultChar.Tone,
+			&resultChar.Definition,
+			&resultChar.Freq)
 		if err != nil {
 			fmt.Printf("Error while getting row data: %s\n", err)
 			os.Exit(1)
 		}
 
-		fmt.Printf("Id => %d\n", zhuyin.Id)
-		fmt.Printf("Title => %s\n", zhuyin.Character)
-		charList.PushBack(zhuyin)
+		fmt.Printf("Id => %d\n", resultChar.Id)
+		fmt.Printf("Title => %s\n", resultChar.Character)
+		charList = append(charList, resultChar)
 	}
 
-	var response = &CharLookupResponse{charList, charList.Len()}
+	var response = &CharLookupResponse{charList, len(charList)}
 
-	// Cache result
-	if charList.Len() > 0 {
+	// Cache results, if there are any
+	if len(charList) > 0 {
 		var firstChar Character
 		// wtf Go syntax- convert value of linked list element to struct type Character
-		firstChar = charList.Front().Value.(Character)
+		firstChar = charList[0]
 
-		// cache in zhuyin or pinyin
+		// cache full result in zhuyin and pinyin caches
 		if firstChar.Pinyin != "" {
-			ref.pinyinCache[firstChar.Pinyin+strconv.Itoa(firstChar.Tone)] = response
+			ref.GlobalCache[firstChar.Pinyin+strconv.Itoa(firstChar.Tone)] = response
 		}
 		if firstChar.Zhuyin != "" {
-			ref.zhuyinCache[firstChar.Zhuyin+strconv.Itoa(firstChar.Tone)] = response
+			ref.GlobalCache[firstChar.Zhuyin+strconv.Itoa(firstChar.Tone)] = response
 		}
 	}
 	return response
@@ -199,30 +202,26 @@ func (ref ReferenceStore) requestThread() {
 }
 
 // Cleans up chan and shuts down, saving the cache
-func (ref ReferenceStore) shutDown() {
+func (ref ReferenceStore) Close() {
 	close(ref.requestQueue)
 	// write cache to file
 	buffer := new(bytes.Buffer)
 	enc := gob.NewEncoder(buffer)
-	// This is safe, since go dereferences the pointers to get the actual objects
-	enc.Encode(ref.zhuyinCache)
-	err := ioutil.WriteFile("zhuyinCache.gob", buffer.Bytes(), 0600)
+	// This is wrong.
+	// map -> *CharLookupResponse -> *Character
+	err := enc.Encode(&ref)
 	if err != nil {
 		panic(err)
 	}
-	buffer = new(bytes.Buffer)
-	enc = gob.NewEncoder(buffer)
-	enc.Encode(ref.pinyinCache)
-	err = ioutil.WriteFile("pinyinCache.gob", buffer.Bytes(), 0600)
+	err = ioutil.WriteFile("globalCache.gob", buffer.Bytes(), 0600)
 	if err != nil {
 		panic(err)
 	}
-
 }
 
 // NewReference initializes the database and returns a Reference object
 func NewReference(dbName string, useCache bool) *ReferenceStore {
-	ref := ReferenceStore{nil, make(chan *CharLookupRequest), make(map[string]*CharLookupResponse), make(map[string]*CharLookupResponse)}
+	ref := ReferenceStore{nil, make(chan *CharLookupRequest), make(map[string]*CharLookupResponse)}
 	conn, err := sqlite.Open(dbName)
 	if err != nil {
 		fmt.Println("Unable to open the database: %s", err)
@@ -232,49 +231,40 @@ func NewReference(dbName string, useCache bool) *ReferenceStore {
 
 	// Create and initialize the database, if it is not yet populated
 	ref.conn.Exec(`CREATE TABLE IF NOT EXISTS characters( id INTEGER PRIMARY KEY AUTOINCREMENT,
-							      character VARCHAR(4), 
-							      zhuyin VARCHAR(12), 
-							      pinyin VARCHAR(5), 
-							      tone INTEGER, definition VARCHAR(50), 
+							      character VARCHAR(4),
+							      zhuyin VARCHAR(12),
+							      pinyin VARCHAR(5),
+							      tone INTEGER, definition VARCHAR(50),
 							      freq INT );`)
-	ref.conn.Exec(`CREATE TABLE IF NOT EXISTS phrases( id INTEGER PRIMARY KEY AUTOINCREMENT, 
-							   character INT, 
-							   phrase VARCHAR(50), 
-							   definition TEXT, 
+	ref.conn.Exec(`CREATE TABLE IF NOT EXISTS phrases( id INTEGER PRIMARY KEY AUTOINCREMENT,
+							   character INT,
+							   phrase VARCHAR(50),
+							   definition TEXT,
 							   freq INT) `)
 
 	//insertSql := `INSERT INTO characters(character, zhuyin, pinyin, tone, definition, freq)
 	//		      VALUES("我","WO","wo",3,"I, me", 0);`
 
-	err = ref.conn.Exec(insertSql)
-	if err != nil {
-		fmt.Println("Error while Inserting: %s", err)
-	}
+	//err = ref.conn.Exec(insertSql)
+	//if err != nil {
+	//fmt.Println("Error while Inserting: %s", err)
+	//}
 
-	// load from caches, TODO: move to function
+	// load from caches, TODO: move to function, also doesn't work
 	if useCache {
-		zhuyinFP, err := ioutil.ReadFile("zhuyin.gob")
+
+		// clean up cache and build new objects
+		cacheFP, err := ioutil.ReadFile("globalCache.gob")
 		if err == nil {
 
-			zhuyinBytes := bytes.NewBuffer(zhuyinFP)
-			zhuyinGobObj := gob.NewDecoder(zhuyinBytes)
-			err = zhuyinGobObj.Decode(ref.zhuyinCache)
+			cacheBytes := bytes.NewBuffer(cacheFP)
+			cacheGobObj := gob.NewDecoder(cacheBytes)
+			err = cacheGobObj.Decode(&ref)
 			if err != nil {
 				panic(err)
 			}
 		} else {
-			fmt.Println("Error loading zhuyin.gob, continuing")
-		}
-		pinyinFP, err := ioutil.ReadFile("pinyin.gob")
-		if err == nil {
-			pinyinBytes := bytes.NewBuffer(pinyinFP)
-			pinyinGobObj := gob.NewDecoder(pinyinBytes)
-			err = pinyinGobObj.Decode(ref.pinyinCache)
-			if err != nil {
-				panic(err)
-			}
-		} else {
-			fmt.Println("Error loading pinyin.gob, continuing")
+			fmt.Println("Error loading globalCache.gob, continuing")
 		}
 	}
 	// Start the DB thread
