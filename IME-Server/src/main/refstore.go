@@ -179,15 +179,21 @@ func (ref ReferenceStore) Get(partialChar Character) *CharLookupResponse {
 	// Cache results, if there are any
 	if len(charList) > 0 {
 		var firstChar Character
-		// wtf Go syntax- convert value of linked list element to struct type Character
 		firstChar = charList[0]
 
-		// cache full result in zhuyin and pinyin caches
+		// cache the full pinyin and zhuyin of the first result
 		if firstChar.Pinyin != "" {
 			ref.GlobalCache[firstChar.Pinyin+strconv.Itoa(firstChar.Tone)] = response
 		}
 		if firstChar.Zhuyin != "" {
 			ref.GlobalCache[firstChar.Zhuyin+strconv.Itoa(firstChar.Tone)] = response
+		}
+		// now cache the partial entry
+		if partialChar.Zhuyin != "" {
+			ref.GlobalCache[partialChar.Zhuyin+toneString] = response
+		}
+		if partialChar.Pinyin != "" {
+			ref.GlobalCache[partialChar.Pinyin+toneString] = response
 		}
 	}
 	return response
@@ -204,11 +210,10 @@ func (ref ReferenceStore) requestThread() {
 // Cleans up chan and shuts down, saving the cache
 func (ref ReferenceStore) Close() {
 	close(ref.requestQueue)
+
 	// write cache to file
 	buffer := new(bytes.Buffer)
 	enc := gob.NewEncoder(buffer)
-	// This is wrong.
-	// map -> *CharLookupResponse -> *Character
 	err := enc.Encode(&ref)
 	if err != nil {
 		panic(err)
@@ -234,7 +239,8 @@ func NewReference(dbName string, useCache bool) *ReferenceStore {
 							      character VARCHAR(4),
 							      zhuyin VARCHAR(12),
 							      pinyin VARCHAR(5),
-							      tone INTEGER, definition VARCHAR(50),
+							      tone INTEGER, 
+							      definition TEXT,
 							      freq INT );`)
 	ref.conn.Exec(`CREATE TABLE IF NOT EXISTS phrases( id INTEGER PRIMARY KEY AUTOINCREMENT,
 							   character INT,
@@ -250,7 +256,7 @@ func NewReference(dbName string, useCache bool) *ReferenceStore {
 	//fmt.Println("Error while Inserting: %s", err)
 	//}
 
-	// load from caches, TODO: move to function, also doesn't work
+	// load from caches
 	if useCache {
 
 		// clean up cache and build new objects
@@ -267,6 +273,7 @@ func NewReference(dbName string, useCache bool) *ReferenceStore {
 			fmt.Println("Error loading globalCache.gob, continuing")
 		}
 	}
+
 	// Start the DB thread
 	go ref.requestThread()
 	return &ref
