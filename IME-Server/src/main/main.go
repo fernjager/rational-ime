@@ -14,6 +14,7 @@ func main() {
 	flag.Parse()
 
 	ref := NewReference(*dbName, *cacheFlag)
+	InitServer(ref)
 	_, num := ref.GetByChar("我")
 	_, num = ref.GetByPinyin("wo3")
 	_, num = ref.GetByPinyin("wo3")
